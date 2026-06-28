@@ -1,8 +1,5 @@
-{
-"name": "Jack (\"Bee\") Nimble",
-"format": {"type":       "rect",
-"width":      1920,
-"height":     1080,
-"interlace":  false,"frame rate": 24
-}
-}
+src/ltchip/fpga/ltchip_fpga_cls_reg_list.c
+src/ltchip/ltchip_init.c
+src/manage/cls_manage.h
+src/script/potb/build_package.sh
+src/script/potb/helf_cls_init.sh
