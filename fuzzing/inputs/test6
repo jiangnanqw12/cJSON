@@ -1,16 +1,139 @@
-bf<!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style type="text/css">
-        html, body, iframe { margin: 0; padding: 0; height: 100%; }
-        iframe { display: block; width: 100%; border: none; }
-      </style>
-    <title>Application Error</title>
-    </head>
-    <body>
-      <iframe src="//s3.amazonaws.com/heroku_pages/error.html">
-        <p>Application Error</p>
-      </iframe>
-    </body>
-    </html>
+# src/shs/l4_lib Code Review Report
+
+## Summary
+
+This report covers a static review of `src/shs/l4_lib`, including:
+
+- `src/shs/l4_lib/common`
+- `src/shs/l4_lib/shs`
+- `src/shs/l4_lib/psd`
+- the local CMake target wiring for the PLC library plugin
+
+The review focused on correctness, crash risks, stale runtime state, memory/resource handling, and test coverage. No build or runtime tests were run. No local tests covering this module were found in the current checkout.
+
+## Findings
+
+### High: Hardware Version INT16 Read Uses INT32 Access
+
+**Location:** `src/shs/l4_lib/shs/maint_shs.c:2132`
+
+`PLCLIB_ShsReadHardwareVersionNodeId` accepts both `UA_TYPES_INT16` and `UA_TYPES_INT32`, but reads the payload unconditionally as `UA_Int32`:
+
+```c
+if ((!UA_Variant_isScalar(&variantArray.value)) ||
+    ((variantArray.value.type != &UA_TYPES[UA_TYPES_INT16]) &&
+     (variantArray.value.type != &UA_TYPES[UA_TYPES_INT32]))) {
+    ...
+} else {
+    g_shsHardwareVersionValue = *(UA_Int32 *)(variantArray.value.data);
+}
+```
+
+**Impact:** If the PLC returns an INT16 hardware version, this performs an invalid 32-bit read from INT16 storage. That can produce the wrong hardware version, select the wrong MBDS page table, and corrupt hardware-version matching. It is also undefined behavior.
+
+**Evidence:** The subscription callback handles INT16 explicitly at `src/shs/l4_lib/shs/maint_shs.c:1727`, but the initial read path does not.
+
+**Recommended fix:** Branch on `variantArray.value.type` before reading:
+
+- for `UA_TYPES_INT16`, read `*(UA_Int16 *)` and cast to `UA_Int32`
+- for `UA_TYPES_INT32`, read `*(UA_Int32 *)`
+- keep the invalid-type fallback unchanged
+
+**Suggested validation:** Add a unit or harness test where the hardware version node returns scalar INT16 value `1`, then verify `g_shsHardwareVersionValue == 1` and `PLCLIB_RefreshMbdsPages(1)` selects the version-1 table.
+
+### High: Runtime Hardware Version Changes Leave Match State Stale
+
+**Location:** `src/shs/l4_lib/shs/maint_shs.c:1742`
+
+`PLCLIB_ShsMonitorHardwareVersionNodeIdCallBack` updates `g_shsHardwareVersionValue` and refreshes MBDS page definitions, but does not rerun hardware-version matching for SHS alarms/devices:
+
+```c
+g_shsHardwareVersionValue = intValue;
+PLCLIB_RefreshMbdsPages(g_shsHardwareVersionValue);
+```
+
+Startup does run the match after the initial hardware-version read:
+
+```c
+ret = PLCLIB_ShsReadHardwareVersionNodeId();
+...
+PLCLIB_ShsMatchHardwareVersion();
+```
+
+**Impact:** If the hardware version changes at runtime, `g_mbdsPagesIndex` changes but each alarm/device keeps its old `hardwareVersion.isVersionMatch` value. `g_shsDeviceIdMatchNum` also remains stale. MBDS full alarm, IO monitor, and test-functions responses can include or exclude the wrong SHS records and can assign wrong PSD offsets.
+
+**Recommended fix:** After `PLCLIB_RefreshMbdsPages(g_shsHardwareVersionValue)` in the subscription callback, call `PLCLIB_ShsMatchHardwareVersion()`. Then refresh affected MBDS views or callbacks that depend on the match state.
+
+**Suggested validation:** Simulate a hardware version change from `0` to `1` and verify:
+
+- SHS alarm/device `isVersionMatch` flags are recomputed
+- `g_shsDeviceIdMatchNum` is recomputed
+- MBDS IO monitor and test-functions outputs reflect the new version
+
+### Medium: Config Parsing Can Crash on Non-String Array Items
+
+**Location:** `src/shs/l4_lib/common/maint_plcLib.c:928`, `src/shs/l4_lib/common/maint_plcLib.c:956`, `src/shs/l4_lib/common/maint_plcLib.c:1037`
+
+The config parser obtains array entries with `cJSON_GetStringValue(item)` and immediately calls `strlen(searchName)` without verifying the item is a string:
+
+```c
+searchName = cJSON_GetStringValue(item);
+if (memcpy_s(..., searchName, strlen(searchName) + 1) != HELF_EOK) {
+    ...
+}
+```
+
+This pattern exists in parsing for:
+
+- `LocationSearch`
+- `FunctionSearch`
+- `TestFunctions`
+
+**Impact:** A malformed config entry such as a number, object, boolean, or null causes `cJSON_GetStringValue` to return `NULL`, then `strlen(NULL)` crashes during module initialization. Bad config should fail gracefully with a parse error.
+
+**Recommended fix:** Validate `searchName != NULL` before copying. Return a JSON/config parse error with enough context to identify the field and index. Consider also rejecting empty strings if empty tab names are invalid.
+
+**Suggested validation:** Add config-parse tests where each affected array contains a non-string item. Expected result: parse returns an error and does not crash.
+
+### Medium: Partial Init Failures Leak Allocated Globals
+
+**Location:** `src/shs/l4_lib/shs/maint_shs.c:386`, `src/shs/l4_lib/shs/maint_shs.c:392`, `src/shs/l4_lib/psd/maint_psd.c:296`
+
+SHS and PSD initialization allocate multiple global buffers and node objects, then return directly on later failures. For example, SHS allocates globals in `PLCLIB_ShsGlobalVariantMalloc`, then `PLCLIB_ShsConfigToGlobalVariantInit` can fail later while parsing OPC UA server info, root nodes, alarms, devices, cfg info, lights, or IM info.
+
+The module init callers also return directly on failures:
+
+- `PLCLIB_ShsModuleInit` returns after `PLCLIB_ShsGlobalVariantInit` or `PLCLIB_EnableShsOpcUaModule` failure.
+- `PLCLIB_PsdModuleInit` returns after `PLCLIB_PsdGlobalVariantInit` or `PLCLIB_EnablePsdOpcUaModule` failure.
+
+**Impact:** Failed initialization can leave allocated global state behind while `g_isShsModuleInit` or `g_isPsdModuleInit` remains false. Repeated init attempts can leak memory and may reuse partially initialized global pointers.
+
+**Recommended fix:** Use a single cleanup path for failed initialization. On any failure after allocation, release all globals through the existing module uninit path or a dedicated internal cleanup helper. Ensure cleanup is safe before the module is marked initialized.
+
+**Suggested validation:** Inject failures after each allocation/parse step and verify all globals are null after init returns an error. Run under ASan or Valgrind if available.
+
+### Low: Test Functions Callback Leaks Root on Print Failure
+
+**Location:** `src/shs/l4_lib/common/maint_plcLib.c:4158`
+
+`PLCLIB_MbdsTestFunctionsInfoToJsonCallback` creates `root`, then returns without deleting it if `cJSON_Print(root)` fails:
+
+```c
+strTestFunctionsCallback = cJSON_Print(root);
+if (strTestFunctionsCallback == NULL) {
+    MAINT_LOG_ERR("cJSON_Print return NULL\n");
+    return;
+}
+```
+
+**Impact:** Under memory pressure, each failed print leaks the cJSON object tree. This is lower severity than the init/runtime state issues, but it is easy to fix and consistent with nearby callback code.
+
+**Recommended fix:** Add `cJSON_Delete(root)` before the return, or refactor the function to use one cleanup label for all exits after `root` is allocated.
+
+**Suggested validation:** Force or mock `cJSON_Print` failure and verify no cJSON allocation remains leaked.
+
+## Additional Notes
+
+- Several JSON construction paths do not consistently check `cJSON_CreateObject`, `cJSON_CreateArray`, or `cJSON_CreateString` results. The specific leak above is directly actionable; broader cJSON allocation hardening would be a worthwhile follow-up.
+- MBDS test-functions JSON uses fixed local arrays sized by `TEST_SEARCH_NUM`, while loops use `mbdsPages.testFunctionsNum`. Current table entries use five test tabs, so the current data is safe. If future hardware versions add more than five test tabs, this function will need bounds checks or dynamic allocation.
+- No local automated tests were found for this module. The most valuable coverage would be config-parse negative tests, hardware-version type tests, and runtime hardware-version-change tests.
