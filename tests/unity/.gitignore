@@ -1,9 +1,301 @@
-build/
-test/sandbox
-.DS_Store
-examples/example_1/test1.exe
-examples/example_1/test2.exe
-examples/example_2/all_tests.exe
-examples/example_1/test1.out
-examples/example_1/test2.out
-examples/example_2/all_tests.out
+# src/shs/l4_lib Code Review Report
+
+## Summary
+
+This report covers a static review of `src/shs/l4_lib`, including:
+
+- `src/shs/l4_lib/common`
+- `src/shs/l4_lib/shs`
+- `src/shs/l4_lib/psd`
+- the local CMake target wiring for the PLC library plugin
+
+The review focused on correctness, crash risks, stale runtime state, memory/resource handling, and test coverage. No build or runtime tests were run. No local tests covering this module were found in the current checkout.
+
+## Findings
+
+### High: Hardware Version INT16 Read Uses INT32 Access
+
+**Location:** `src/shs/l4_lib/shs/maint_shs.c:2132`
+
+`PLCLIB_ShsReadHardwareVersionNodeId` accepts both `UA_TYPES_INT16` and `UA_TYPES_INT32`, but reads the payload unconditionally as `UA_Int32`:
+
+```c
+if ((!UA_Variant_isScalar(&variantArray.value)) ||
+    ((variantArray.value.type != &UA_TYPES[UA_TYPES_INT16]) &&
+     (variantArray.value.type != &UA_TYPES[UA_TYPES_INT32]))) {
+    ...
+} else {
+    g_shsHardwareVersionValue = *(UA_Int32 *)(variantArray.value.data);
+}
+```
+
+**Impact:** If the PLC returns an INT16 hardware version, this performs an invalid 32-bit read from INT16 storage. That can produce the wrong hardware version, select the wrong MBDS page table, and corrupt hardware-version matching. It is also undefined behavior.
+
+**Evidence:** The subscription callback handles INT16 explicitly at `src/shs/l4_lib/shs/maint_shs.c:1727`, but the initial read path does not.
+
+**Recommended fix:** Branch on `variantArray.value.type` before reading:
+
+- for `UA_TYPES_INT16`, read `*(UA_Int16 *)` and cast to `UA_Int32`
+- for `UA_TYPES_INT32`, read `*(UA_Int32 *)`
+- keep the invalid-type fallback unchanged
+
+**Suggested validation:** Add a unit or harness test where the hardware version node returns scalar INT16 value `1`, then verify `g_shsHardwareVersionValue == 1` and `PLCLIB_RefreshMbdsPages(1)` selects the version-1 table.
+› High: Hardware Version INT16 Read Uses INT32 Access 这个的问题是什么 ,如果给的数据是16位指针 转成32位指针的问题嘛?
+
+
+• 是的，核心问题就是：底层数据实际只有 16 位，但代码把它当成 32 位指针解引用。
+
+  当前代码逻辑等价于：
+
+  // value.data 实际可能指向 UA_Int16
+  g_shsHardwareVersionValue = *(UA_Int32 *)(variantArray.value.data);
+
+  如果 PLC 返回的是 UA_TYPES_INT16，value.data 指向的内存只保证有 sizeof(UA_Int16)，也就是 2 字节。但代码强制转成 UA_Int32 * 后会读 4 字节。这会导致：
+
+  1. 越界读取：多读后面 2 个字节，属于未定义行为。
+  2. 值可能错误：比如实际硬件版本是 1，读 4 字节后可能变成某个随机大数，取决于后面内存内容。
+  3. 后续逻辑错误：硬件版本值错了以后，PLCLIB_RefreshMbdsPages() 会选错 MBDS 页签表，PLCLIB_ShsMatchHardwareVersion() 也可能匹配错告警和设备。
+  4. 在严格对齐平台上可能崩溃：如果 32 位读取要求 4 字节对齐，而这个地址不满足，也可能直接异常。
+
+  正确写法应该按实际类型读：
+
+  if (variantArray.value.type == &UA_TYPES[UA_TYPES_INT16]) {
+      g_shsHardwareVersionValue = (UA_Int32)(*(UA_Int16 *)variantArray.value.data);
+  } else if (variantArray.value.type == &UA_TYPES[UA_TYPES_INT32]) {
+      g_shsHardwareVersionValue = *(UA_Int32 *)variantArray.value.data;
+  }
+
+  订阅回调里其实已经是这种思路，只接受 INT16 并按 UA_Int16 * 读，所以初始读取路径这里确实不一致。
+### High: Runtime Hardware Version Changes Leave Match State Stale
+
+**Location:** `src/shs/l4_lib/shs/maint_shs.c:1742`
+
+`PLCLIB_ShsMonitorHardwareVersionNodeIdCallBack` updates `g_shsHardwareVersionValue` and refreshes MBDS page definitions, but does not rerun hardware-version matching for SHS alarms/devices:
+
+```c
+g_shsHardwareVersionValue = intValue;
+PLCLIB_RefreshMbdsPages(g_shsHardwareVersionValue);
+```
+
+Startup does run the match after the initial hardware-version read:
+
+```c
+ret = PLCLIB_ShsReadHardwareVersionNodeId();
+...
+PLCLIB_ShsMatchHardwareVersion();
+```
+
+**Impact:** If the hardware version changes at runtime, `g_mbdsPagesIndex` changes but each alarm/device keeps its old `hardwareVersion.isVersionMatch` value. `g_shsDeviceIdMatchNum` also remains stale. MBDS full alarm, IO monitor, and test-functions responses can include or exclude the wrong SHS records and can assign wrong PSD offsets.
+
+**Recommended fix:** After `PLCLIB_RefreshMbdsPages(g_shsHardwareVersionValue)` in the subscription callback, call `PLCLIB_ShsMatchHardwareVersion()`. Then refresh affected MBDS views or callbacks that depend on the match state.
+
+**Suggested validation:** Simulate a hardware version change from `0` to `1` and verify:
+
+- SHS alarm/device `isVersionMatch` flags are recomputed
+- `g_shsDeviceIdMatchNum` is recomputed
+- MBDS IO monitor and test-functions outputs reflect the new version
+
+ Runtime Hardware Version Changes Leave Match State Stale 这个问题有点没懂, 就是 实时运行的时候, plc换了版本, plclib还在运行的情况下可能出错, 两个一起重启就没问题把?
+
+
+• 对，你理解得基本正确。
+
+  这个问题只发生在这种场景：
+
+  1. plclib 已经启动并完成初始化。
+  2. 它启动时读取了 PLC 硬件版本，比如版本 0。
+  3. 它根据版本 0 执行了：
+      - PLCLIB_RefreshMbdsPages(0)
+      - PLCLIB_ShsMatchHardwareVersion()
+
+  4. 后面 PLC 在运行中变成了版本 1，或者硬件版本节点值从 0 变成 1。
+  5. 回调里只做了：
+
+  g_shsHardwareVersionValue = intValue;
+  PLCLIB_RefreshMbdsPages(g_shsHardwareVersionValue);
+
+  也就是只刷新了 MBDS 页签配置，没有重新执行：
+
+  PLCLIB_ShsMatchHardwareVersion();
+
+  所以会出现不一致：
+
+  - g_mbdsPagesIndex 已经是新版本的页签。
+  - 但每个 alarm/device 的 hardwareVersion.isVersionMatch 还是旧版本匹配结果。
+  - g_shsDeviceIdMatchNum 也还是旧版本计算结果。
+
+  如果 PLC 和 plclib 一起重启，那问题一般不会发生，因为启动流程里会重新读硬件版本，并且在 src/shs/l4_lib/shs/maint_shs.c:2290 调用：
+
+  PLCLIB_ShsMatchHardwareVersion();
+
+  所以状态会重新对齐。
+
+  更准确地说：这个是“运行期间硬件版本变化但 plclib 不重启”时的状态同步 bug。实际风险取决于现场是否允许/会发生 PLC 软件升级、硬件版本节点变化、PLC 断连重连但 plclib 进程不重启。如果升级流程一定会重启 plclib，那
+  这个问题影响就低很多；如果 PLC 可单独升级或重连后版本变化，那就是真问题。
+
+### Medium: Config Parsing Can Crash on Non-String Array Items
+
+**Location:** `src/shs/l4_lib/common/maint_plcLib.c:928`, `src/shs/l4_lib/common/maint_plcLib.c:956`, `src/shs/l4_lib/common/maint_plcLib.c:1037`
+
+The config parser obtains array entries with `cJSON_GetStringValue(item)` and immediately calls `strlen(searchName)` without verifying the item is a string:
+
+```c
+searchName = cJSON_GetStringValue(item);
+if (memcpy_s(..., searchName, strlen(searchName) + 1) != HELF_EOK) {
+    ...
+}
+```
+
+This pattern exists in parsing for:
+
+- `LocationSearch`
+- `FunctionSearch`
+- `TestFunctions`
+
+**Impact:** A malformed config entry such as a number, object, boolean, or null causes `cJSON_GetStringValue` to return `NULL`, then `strlen(NULL)` crashes during module initialization. Bad config should fail gracefully with a parse error.
+
+**Recommended fix:** Validate `searchName != NULL` before copying. Return a JSON/config parse error with enough context to identify the field and index. Consider also rejecting empty strings if empty tab names are invalid.
+
+**Suggested validation:** Add config-parse tests where each affected array contains a non-string item. Expected result: parse returns an error and does not crash.
+searchName = cJSON_GetStringValue(item); item 不为null searchName也可能为null嘛
+
+
+• 会的。item != NULL 只说明数组这个位置有一个 cJSON 节点，不说明它是字符串。
+
+  cJSON_GetStringValue(item) 通常只有在 item 是字符串类型时才返回 item->valuestring；如果 item 是 number、bool、object、array、null 等，就会返回 NULL。
+
+  比如配置里写成这样：
+
+  {
+    "TestFunctions": ["EMO", 123, "CO2"]
+  }
+
+  解析到第二项时：
+
+  item = cJSON_GetArrayItem(jsonInfo, 1);   // 不为 NULL
+  searchName = cJSON_GetStringValue(item); // 为 NULL，因为 item 是 number
+  strlen(searchName);                       // strlen(NULL)，崩溃
+
+  所以这里至少要加：
+
+  searchName = cJSON_GetStringValue(item);
+  if (searchName == NULL) {
+      MAINT_LOG_ERR("invalid string item, index: %d\n", i);
+      return (UINT64)MAINT_JSON_GETOBJ_ERROR;
+  }
+
+  顺带一提，你这条标题写的是 Partial Init Failures Leak Allocated Globals，但你问的代码是另一个 finding：Config Parsing Can Crash on Non-String Array Items。这两个是不同问题。
+  
+### Medium: Partial Init Failures Leak Allocated Globals
+
+**Location:** `src/shs/l4_lib/shs/maint_shs.c:386`, `src/shs/l4_lib/shs/maint_shs.c:392`, `src/shs/l4_lib/psd/maint_psd.c:296`
+
+SHS and PSD initialization allocate multiple global buffers and node objects, then return directly on later failures. For example, SHS allocates globals in `PLCLIB_ShsGlobalVariantMalloc`, then `PLCLIB_ShsConfigToGlobalVariantInit` can fail later while parsing OPC UA server info, root nodes, alarms, devices, cfg info, lights, or IM info.
+
+The module init callers also return directly on failures:
+
+- `PLCLIB_ShsModuleInit` returns after `PLCLIB_ShsGlobalVariantInit` or `PLCLIB_EnableShsOpcUaModule` failure.
+- `PLCLIB_PsdModuleInit` returns after `PLCLIB_PsdGlobalVariantInit` or `PLCLIB_EnablePsdOpcUaModule` failure.
+
+**Impact:** Failed initialization can leave allocated global state behind while `g_isShsModuleInit` or `g_isPsdModuleInit` remains false. Repeated init attempts can leak memory and may reuse partially initialized global pointers.
+
+**Recommended fix:** Use a single cleanup path for failed initialization. On any failure after allocation, release all globals through the existing module uninit path or a dedicated internal cleanup helper. Ensure cleanup is safe before the module is marked initialized.
+
+**Suggested validation:** Inject failures after each allocation/parse step and verify all globals are null after init returns an error. Run under ASan or Valgrind if available.
+• 对，这个问题的本质是：初始化失败后，已经分配到全局变量里的内存没有释放；如果外部再次调用 init，就可能覆盖旧指针，导致旧内存永久泄漏。
+
+  以 SHS 为例，路径是：
+
+  PLCLIB_ShsModuleInit()
+    -> PLCLIB_ShsGlobalVariantInit()
+      -> PLCLIB_ShsConfigToGlobalVariantInit()
+        -> PLCLIB_ShsGlobalVariantMalloc()
+
+  在 src/shs/l4_lib/shs/maint_shs.c:246 这一组全局变量会被分配：
+
+  g_shsRootNodeId
+  g_shsVersionInfo
+  g_shsAlarmInfo
+  g_shsDeviceInfo
+  g_shsCfgInfo
+
+  后面还会分配：
+
+  g_shsAlarmTable
+  g_shsDeviceTable
+  g_shsLightTable
+  g_shsOverrideLightTable
+  g_shsIMStatusTable
+  g_shsSafetyStatus
+  g_shsSafetyReset
+  g_shsPlcNtp
+  g_shsPlcNtpAddr
+  g_shsHardwareVersion
+
+  问题在于，分配成功后，后续解析可能失败，比如：
+
+  ret = PLCLIB_ConfigParseOpcUaServerInfo(...);
+  if (ret != HELF_EOK) {
+      return ret;
+  }
+
+  这个失败路径在 src/shs/l4_lib/shs/maint_shs.c:392 附近。它直接 return ret，没有调用 PLCLIB_ShsModuleUninit() 或释放刚才分配的全局变量。
+
+  然后 PLCLIB_ShsModuleInit() 也直接返回失败：
+
+  ret = PLCLIB_ShsGlobalVariantInit(projectName);
+  if (ret != HELF_EOK) {
+      return ret;
+  }
+
+  因为 g_isShsModuleInit 还没置 TRUE，下一次再调用 PLCLIB_ShsModuleInit() 会继续执行初始化。此时 PLCLIB_ShsGlobalVariantMalloc() 会再次给这些全局指针赋新值：
+
+  *shsVariableMalloc[i].variable = PLCLIB_GlobalVarMallocFromCfg(...);
+
+  如果旧的 g_shsAlarmInfo 等指针还指向上次分配的内存，这里会被新 malloc 返回值覆盖。旧内存没有任何指针能再访问，就泄漏了。
+
+  PSD 同理，主要变量是：
+
+  g_psdRootNodeId
+  g_psdVersionInfo
+  g_psdAlarmInfo
+  g_psdDeviceInfo
+  g_psdAlarmTable
+  g_psdDeviceTable
+  g_psdPlcNtp
+  g_psdPlcNtpAddr
+
+  修复思路很简单：凡是 init 过程中，只要已经分配过全局资源，后续失败就走 cleanup：
+
+  ret = PLCLIB_ShsGlobalVariantInit(projectName);
+  if (ret != HELF_EOK) {
+      PLCLIB_ShsModuleUninit();
+      return ret;
+  }
+
+  或者在 PLCLIB_ShsConfigToGlobalVariantInit() 内部用统一 goto cleanup，失败时释放它自己已经分配的资源。
+### Low: Test Functions Callback Leaks Root on Print Failure
+
+**Location:** `src/shs/l4_lib/common/maint_plcLib.c:4158`
+
+`PLCLIB_MbdsTestFunctionsInfoToJsonCallback` creates `root`, then returns without deleting it if `cJSON_Print(root)` fails:
+
+```c
+strTestFunctionsCallback = cJSON_Print(root);
+if (strTestFunctionsCallback == NULL) {
+    MAINT_LOG_ERR("cJSON_Print return NULL\n");
+    return;
+}
+```
+
+**Impact:** Under memory pressure, each failed print leaks the cJSON object tree. This is lower severity than the init/runtime state issues, but it is easy to fix and consistent with nearby callback code.
+
+**Recommended fix:** Add `cJSON_Delete(root)` before the return, or refactor the function to use one cleanup label for all exits after `root` is allocated.
+
+**Suggested validation:** Force or mock `cJSON_Print` failure and verify no cJSON allocation remains leaked.
+
+## Additional Notes
+
+- Several JSON construction paths do not consistently check `cJSON_CreateObject`, `cJSON_CreateArray`, or `cJSON_CreateString` results. The specific leak above is directly actionable; broader cJSON allocation hardening would be a worthwhile follow-up.
+- MBDS test-functions JSON uses fixed local arrays sized by `TEST_SEARCH_NUM`, while loops use `mbdsPages.testFunctionsNum`. Current table entries use five test tabs, so the current data is safe. If future hardware versions add more than five test tabs, this function will need bounds checks or dynamic allocation.
+- No local automated tests were found for this module. The most valuable coverage would be config-parse negative tests, hardware-version type tests, and runtime hardware-version-change tests.
