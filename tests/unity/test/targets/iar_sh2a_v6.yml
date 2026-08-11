@@ -1,86 +1,50 @@
-tools_root: &tools_root 'C:\Program Files\IAR Systems\Embedded Workbench 6.0\'
-compiler:
-  path:             [*tools_root, 'sh\bin\iccsh.exe']
-  source_path:      '..\src\'
-  unit_tests_path:  &unit_tests_path 'tests\'
-  build_path:       &build_path 'build\'
-  options:
-    - -e
-    - --char_is_signed
-    - -Ol
-    - --no_cse
-    - --no_unroll
-    - --no_inline
-    - --no_code_motion
-    - --no_tbaa
-    - --no_scheduling
-    - --no_clustering
-    - --debug
-    - --dlib_config
-    - [*tools_root, 'sh\inc\DLib_Product.h']
-    - --double=32
-    - --code_model=huge
-    - --data_model=huge
-    - --core=sh2afpu
-    - --warnings_affect_exit_code
-    - --warnings_are_errors
-    - --mfc
-    - --use_unix_directory_separators
-    - --diag_suppress=Pe161
-  includes:
-    prefix: '-I'
-    items:
-      - [*tools_root, 'sh\inc\']
-      - [*tools_root, 'sh\inc\c']
-      - 'src\'
-      - '..\src\'
-      - 'testdata/'
-      - *unit_tests_path
-      - 'vendor\unity\src\'
-  defines:
-    prefix: '-D'
-    items:
-      - UNITY_SUPPORT_64
-      - 'UNITY_SUPPORT_TEST_CASES'
-  object_files:
-    prefix: '-o'
-    extension: '.o'
-    destination: *build_path
-linker:
-  path: [*tools_root, 'sh\bin\ilinksh.exe']
-  options:
-    - --redirect __Printf=__PrintfSmall
-    - --redirect __Scanf=__ScanfSmall
-    - --config
-    - [*tools_root, 'sh\config\generic.icf']
-    - --config_def _CSTACK_SIZE=0x800
-    - --config_def _HEAP_SIZE=0x800
-    - --config_def _INT_TABLE=0x10
-    - --entry __iar_program_start
-    - --debug_lib
-  object_files:
-    path: *build_path
-    extension: '.o'
-  bin_files:
-    prefix: '-o'
-    extension: '.out'
-    destination: *build_path
-simulator:
-  path: [*tools_root, 'common\bin\CSpyBat.exe']
-  pre_support:
-    - --silent
-    - [*tools_root, 'sh\bin\shproc.dll']
-    - [*tools_root, 'sh\bin\shsim.dll']
-  post_support:
-    - --plugin
-    - [*tools_root, 'sh\bin\shbat.dll']
-    - --backend
-    - -B
-    - --core sh2afpu
-    - -p
-    - [*tools_root, 'sh\config\debugger\io7264.ddf']
-    - -d
-    - sim
-colour: true
-:unity:
-  :plugins: []
+# Blackfly S 配置项与寄存器映射
+
+本文对应当前参与构建的 Blackfly S BFS-PGE-50S5M 驱动。下表沿用旧 GEV 操作表的
+顺序；同一语义的 Set 和 Get 共用一个 LTSensor `cfgItem`。`MVS_CFG_IMAGE` 和
+`MVS_CFG_ACQUISITION` 保留为兼容的聚合接口，独立 cfgItem 从
+`MVS_CFG_TRIGGER_MODE`（4）开始追加。
+
+| 含义 | cfgItem | 输入参数 | 输出参数 | 寄存器 NAME | 寄存器 ADDRESS | 寄存器 VALUE / 换算 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 设置相机触发模式 | `MVS_CFG_TRIGGER_MODE` | `MVS_TriggerModeConfig {mode,source}` | 状态码 | `kTriggerSource`、`kTriggerMode` | `0x000C842C`、`0x000C8424` | `mode` 为 Off（0）或 On（1）；`source` 为 Software（0）或 Line0–Line3（1–4），均直接写入。 |
+| 获取相机触发模式 | `MVS_CFG_TRIGGER_MODE` | 无 | `MVS_TriggerModeConfig` | 同上 | 同上 | 返回最后成功设置的模式及触发源。 |
+| 设置相机帧率 | `MVS_CFG_FRAME_RATE` | `MVS_FrameRateConfig.frameRateFps` | 状态码 | `kFrameRateEnable`、`kFrameRateValue` | `0x000C1124`、`0x000C1104` | 使能写 1；值写 `round(125000000 / fps)`。 |
+| 获取相机帧率 | `MVS_CFG_FRAME_RATE` | 无 | `MVS_FrameRateConfig.frameRateFps` | 同上 | 同上 | 返回驱动已成功应用的缓存值。 |
+| 设置相机曝光时间 | `MVS_CFG_EXPOSURE_TIME` | `MVS_ExposureTimeConfig.exposureTimeUs` | 状态码 | `kExposureAuto`、`kExposureTime` | `0x000C2008`、`0x000C1004` | 自动曝光写 0；曝光直接写微秒值。 |
+| 获取相机曝光时间 | `MVS_CFG_EXPOSURE_TIME` | 无 | `MVS_ExposureTimeConfig.exposureTimeUs` | 同上 | 同上 | 返回驱动已成功应用的缓存值。 |
+| 连续传输图像模式控制 | 相机不支持 | 无 | 无 | 不适用 | 不适用 | 旧 GEV 专有 continuous-shot 寄存器不适用于 Blackfly S；相机使用标准 GVSP 图像流。 |
+| 设置相机采集模式 | `MVS_CFG_ACQUISITION_MODE` | `MVS_AcquisitionModeConfig {mode,frameCount}` | 状态码 | `kAcquisitionFrameCount`、`kAcquisitionMode` | `0x000C00A4`、`0x000C00C8` | `mode` 为 Continuous（0）、SingleFrame（1）或 MultiFrame（2）；`frameCount` 大于 0，MultiFrame 时为采集帧数。 |
+| 使能相机采集图像经相机缓存再传输功能 | `MVS_CFG_IMAGE_BUFFER_INFO`（只读） | 无 | `MVS_ImageBufferInfo.capacityBytes` | 无写寄存器 | 不适用 | 相机支持 240 MB 图像缓存；驱动仅报告容量，不暴露未验证的缓存保持/重传写控制。 |
+| 获取相机当前的载荷大小 | `MVS_CFG_PAYLOAD_SIZE`（只读） | 无 | `MVS_PayloadSizeConfig.payloadSizeBytes` | `kPayloadSize` | `0x20002008` | 直接读取当前 `UINT32` 载荷字节数。 |
+| 设置 stream 通道的目标地址和端口 | `MVS_CFG_STREAM_ENDPOINT`（只读） | 无 | `MVS_StreamEndpointConfig {ipv4Address,port}` | `kStreamDestination`、`kStreamPort` | `0x00000D18`、`0x00000D00` | `StartCapture` 绑定本地 UDP socket 后自动写入本地 IP、端口；采集期间可查询，禁止外部改写。 |
+| 设置图像 ROI 参数 | `MVS_CFG_ROI` | `MVS_RoiConfig {width,height,offsetX,offsetY}` | 状态码 | `kWidth`、`kHeight`、`kOffsetX`、`kOffsetY` | `0x00081084`、`0x00081064`、`0x00081044`、`0x00081024` | 像素值直接写入；驱动先清零偏移，再写宽高和最终偏移。 |
+| 获取图像 ROI 参数 | `MVS_CFG_ROI` | 无 | `MVS_RoiConfig` | 同上 | 同上 | 返回驱动已成功应用的缓存值。 |
+| 设置相机数据包大小 | `MVS_CFG_PACKET_SIZE` | `MVS_PacketSizeConfig.packetSizeBytes` | 状态码 | `kStreamPacketSize` | `0x00000D04` | 写 `packetSizeBytes | 0x40000000`，校验时忽略该标志位。 |
+| 获取相机数据包大小 | `MVS_CFG_PACKET_SIZE` | 无 | `MVS_PacketSizeConfig.packetSizeBytes` | 同上 | 同上 | 返回驱动已成功应用的缓存值。 |
+| 设置相机数据包延时 | `MVS_CFG_PACKET_DELAY` | `MVS_PacketDelayConfig.delayUs` | 状态码 | `kTimestampTickHigh`、`kTimestampTickLow`、`kStreamPacketDelay` | `0x0000093C`、`0x00000940`、`0x00000D08` | 延时值 = `round(tickFrequency * delayUs / 1000000)`。 |
+| 获取相机数据包延时 | `MVS_CFG_PACKET_DELAY` | 无 | `MVS_PacketDelayConfig.delayUs` | 同上 | 同上 | 返回驱动已成功应用的缓存值。 |
+| 设置相机增益 | `MVS_CFG_GAIN` | `MVS_GainConfig.gainDb` | 状态码 | `kGainAuto`、`kGainValue` | `0x00104008`、`0x00104804` | 自动增益写 0；值写 IEEE-754 `float(gainDb)` 位模式。 |
+| 获取相机增益 | `MVS_CFG_GAIN` | 无 | `MVS_GainConfig.gainDb` | 同上 | 同上 | 返回驱动已成功应用的缓存值。 |
+| 设置相机视频模式 | `MVS_CFG_BINNING` | `MVS_BinningConfig.binning` | 状态码 | `kBinningHorizontalMode`、`kBinningVerticalMode`、`kBinningHorizontal`、`kBinningVertical` | `0x00084028`、`0x00084048`、`0x00084C04`、`0x00084404` | Blackfly S 以 binning 取代旧视频模式；支持 1x1（1）和 2x2（2）。 |
+| 获取相机视频模式 | `MVS_CFG_BINNING` | 无 | `MVS_BinningConfig.binning` | 同上 | 同上 | 返回驱动已成功应用的缓存值。 |
+| 设置图像像素格式 | `MVS_CFG_PIXEL_FORMAT` | `MVS_PixelFormatConfig.pixelFormat` | 状态码 | `kPixelFormat` | `0x00086008` | Mono8（0）=`0x01080001`，Mono10p（1）=`0x010A0046`，Mono12p（2）=`0x010C0047`，Mono16（3）=`0x01100007`。 |
+| 获取图像像素格式 | `MVS_CFG_PIXEL_FORMAT` | 无 | `MVS_PixelFormatConfig.pixelFormat` | 同上 | 同上 | 返回驱动已成功应用的缓存值；图像输出同步携带对应的 `MVS_ImageData.pixelFormat` 和字节 stride。 |
+| 获取相机温度 | `MVS_CFG_TEMPERATURE`（只读） | 无 | `MVS_TemperatureConfig.temperatureCelsius` | `kDeviceTemperature` | `0x00041004` | 读取 IEEE-754 `float` 位模式并转换为摄氏度。 |
+| 相机停止采集 | `MVS_CFG_CAPTURE_CONTROL` | `MVS_CaptureControl.enable = 0` | 状态码 | `kAcquisitionStop` | `0x000C0024` | 写 1 停止采集，并清零 stream 目的地址和端口。 |
+| 相机开始采集 | `MVS_CFG_CAPTURE_CONTROL` | `MVS_CaptureControl.enable = 1` | 状态码 | `kAcquisitionStart`、`kTriggerSoftware` | `0x000C0004`、`0x000C8824` | 写 1 开始采集；启用 Software 触发时，随后写 `kTriggerSoftware = 1` 触发一次。 |
+| 设置相机心跳超时 | `MVS_CFG_HEARTBEAT_TIMEOUT` | `MVS_HeartbeatTimeoutConfig.timeoutMs` | 状态码 | `kHeartbeatTimeout` | `0x00000938` | 直接写毫秒值；必须大于 0，默认 10000 ms。 |
+| 相机打开 | 不适用（`LTSensor_Open(3200)`） | 无 | 状态码 | `kCcp`、`kHeartbeatTimeout` 等 | 多个 | 建立 GVCP 连接、校验型号、取得控制权限并应用配置；不是 cfgItem。 |
+
+## 约束
+
+| 项目 | 当前限制 |
+| --- | --- |
+| 参数修改时机 | 除采集启停外，相机必须 Open 且未采集。 |
+| ROI | 不能超出当前 binning 下的有效尺寸。 |
+| 曝光、增益、帧率 | 分别为 27–30000000 µs、0–47.9943 dB、1–24 fps。 |
+| 数据包 | 包大小为 576–9000 字节，延时为 0–1000000 µs。 |
+| 触发与采集模式 | Software/Line0–Line3 触发源均可设置；Software 触发命令在每次开始采集时执行一次。采集模式支持 Continuous、SingleFrame、MultiFrame。 |
+
+源码：`inc/mvs_sensor_type.h`、`src/ltsensor/mvs_camera.cpp`、
+`src/ltsensor/mvs_protocol.hpp`。
