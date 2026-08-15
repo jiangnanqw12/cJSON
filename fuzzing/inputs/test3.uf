@@ -1,26 +1,617 @@
-uf{"widget": {
-    "debug": "on",
-    "window": {
-        "title": "Sample Konfabulator Widget",
-        "name": "main_window",
-        "width": 500,
-        "height": 500
-    },
-    "image": {
-        "src": "Images/Sun.png",
-        "name": "sun1",
-        "hOffset": 250,
-        "vOffset": 250,
-        "alignment": "center"
-    },
-    "text": {
-        "data": "Click Here",
-        "size": 36,
-        "style": "bold",
-        "name": "text1",
-        "hOffset": 250,
-        "vOffset": 100,
-        "alignment": "center",
-        "onMouseUp": "sun1.opacity = (sun1.opacity / 100) * 90;"
-    }
-}}
+# CCH 编译、仿真与实物测试 SOP
+
+本文档是 CCH 设备的自包含测试入口，从原生 Linux 编译和完整
+standalone 基线开始，依次覆盖本机仿真、GPB 工具自环、GPB 连接外部
+仿真器的产品路径以及 CCH 实物验收。按本文执行不需要先阅读其他
+SOP；公共文档仅用于解释跨设备的策略、部署和报告规则。
+
+## 1. 测试层级和结论边界
+
+| 层级 | 被测端 | CCH 对端 | 证明范围 |
+| --- | --- | --- | --- |
+| 原生 Linux 本机仿真 | C 测试、C CLI | 本机 C 或 Python 仿真器 | 主机代码、协议和跨实现兼容性 |
+| GPB 工具自环 | GPB C CLI | GPB C 仿真器 | AArch64 产物可加载且工具可通信 |
+| GPB 外部产品仿真 | GPB 业务调用进程和 `libhelf_cp_cls.so` | 辅助 Linux 机 C 或 Python 仿真器 | 实际 `ltsensor` 产品路径 |
+| 实物测试 | GPB 业务路径或隔离 CLI | 真实 CCH | 网络、协议及真实设备行为 |
+
+CLI 是独立诊断进程，不会把命令注入 `cls_mng`。工具自环成功不能
+替代产品仿真或实物产品路径验收。当前 `cls_mng` 初始化表不调用
+`CLS_LTSensor_Init()`；产品验收必须找到实际业务调用进程，并确认它
+完成 `CLS_LTSensor_Init()`、`OpenSensor(CLS_SENSOR_CCH)` 和读写调用。
+
+## 2. 环境和通用变量
+
+在完整 pd checkout 根目录执行本文命令。standalone 入口仍会编译 pd
+中的公共 LTSensor 配置和适配源码，不能只复制 CLS 子模块构建。
+
+```bash
+cmake --version
+gcc --version
+python3 --version
+git -C "$PWD" rev-parse --show-toplevel
+```
+
+本机普通联调使用非特权端口 `1502`；实物 Modbus TCP 通常使用
+`502`。使用 Python 仿真器或报告转换前，准备 ETH-PY checkout 和 runner
+固定使用的 Python 环境。ETH-PY 运行时只依赖 Python 标准库；如虚拟环境不存在，
+直接创建：
+
+```bash
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+ETH_PY_PYTHON="$HOME/venv/ETH-PY/default/bin/python"
+test -d "$ETH_PY_ROOT"
+if ! test -x "$ETH_PY_PYTHON"; then
+  python3 -m venv "$HOME/venv/ETH-PY/default"
+fi
+"$ETH_PY_PYTHON" --version
+```
+
+再检查本 SOP 需要的三个 runner：
+
+```bash
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+CCH_PY_SIM="$ETH_PY_ROOT/src/cch/simulator/cli_runner.sh"
+CCH_PY_CLI="$ETH_PY_ROOT/src/cch/cli_runner.sh"
+REPORT_RUNNER="$ETH_PY_ROOT/src/reporting/cli_runner.sh"
+test -x "$CCH_PY_SIM"
+test -x "$CCH_PY_CLI"
+test -x "$REPORT_RUNNER"
+```
+
+Python 仿真器只在编译机或辅助 Linux 机上运行。不假定 GPB 安装了
+Python 或 ETH-PY。
+
+## 3. 原生 Linux 编译和完整基线
+
+### 3.1 普通构建和 7 个 CTest
+
+```bash
+cmake -S src/subsystem/cls/test/eth -B build/cls-ltdrv-test \
+  -DBUILD_TESTING=ON \
+  -DCLS_TEST_JSON_REPORT=OFF
+cmake --build build/cls-ltdrv-test
+ctest --test-dir build/cls-ltdrv-test --output-on-failure
+```
+
+必须看到 `100% tests passed, 0 tests failed out of 7`。其中 CCH 直接相关的
+suite 为 `cls_cch_sim_tests`、`cls_cch_driver_tests` 和
+`cls_cch_requirement_tests`；共享 transport 和 integration 仍属于完整准入基线。
+
+排障时可在完整基线通过后聚焦复跑：
+
+```bash
+ctest --test-dir build/cls-ltdrv-test \
+  -R '^(cls_ltsensor_transport_unit_tests|cls_ltsensor_integration_tests|cls_cch_.*)$' \
+  --output-on-failure
+```
+
+构建产物：
+
+```text
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli
+build/cls-ltdrv-test/cls/eth_modbus_cch_sim
+build/cls-ltdrv-test/cases/cls_cch_requirement_tests
+```
+
+### 3.2 生成完整 JSON/HTML 报告
+
+报告使用独立构建目录，不在普通测试构建中来回切换 CMake cache：
+
+```bash
+RAW_DIR="$PWD/build/cls-ltdrv-report-test/reports/sim/raw"
+
+cmake -S src/subsystem/cls/test/eth -B build/cls-ltdrv-report-test \
+  -DBUILD_TESTING=ON \
+  -DCLS_TEST_JSON_REPORT=ON \
+  -DCLS_TEST_JSON_REPORT_DIR="$RAW_DIR"
+cmake --build build/cls-ltdrv-report-test
+cmake -E remove_directory "$RAW_DIR"
+cmake -E make_directory "$RAW_DIR"
+ctest --test-dir build/cls-ltdrv-report-test --output-on-failure
+
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+REPORT_RUNNER="$ETH_PY_ROOT/src/reporting/cli_runner.sh"
+test -x "$REPORT_RUNNER"
+"$REPORT_RUNNER" "$RAW_DIR"
+```
+
+确认 6 份 raw suite，特别是 CCH 的三份报告：
+
+```bash
+test "$(find "$RAW_DIR" -maxdepth 1 -type f -name '*.suite.json' | wc -l)" -eq 6
+test -s "$RAW_DIR/cch_sim.suite.json"
+test -s "$RAW_DIR/cch_driver.suite.json"
+test -s "$RAW_DIR/cch_requirements.suite.json"
+
+REPORT_DIR="$PWD/build/cls-ltdrv-report-test/reports/sim"
+test -s "$REPORT_DIR/cls_ltdrv_test_report.json"
+test -s "$REPORT_DIR/cls_ltdrv_test_report.html"
+```
+
+如安装了 `jq`，继续确认 schema 和失败数：
+
+```bash
+jq -e '
+  .schema == "cls_ltdrv_test_report.v1"
+  and .summary.failed == 0
+' "$REPORT_DIR/cls_ltdrv_test_report.json"
+```
+
+`skipped` 是安全保护状态，不按失败计算。正式报告必须由完整基线生成；
+聚焦复跑只用于定位，不覆盖这份报告。
+
+## 4. 原生 Linux 本机仿真
+
+### 4.1 C 仿真器 + C CLI
+
+终端 1：
+
+```bash
+build/cls-ltdrv-test/cls/eth_modbus_cch_sim \
+  --host 127.0.0.1 --port 1502 --unit-id 1 --verbose
+```
+
+终端 2：
+
+```bash
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli \
+  --host 127.0.0.1 --port 1502 --unit-id 1 read-temp
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli \
+  --host 127.0.0.1 --port 1502 --unit-id 1 read-measure --channel 1
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli \
+  --host 127.0.0.1 --port 1502 --unit-id 1 read-channel-param --channel 1
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli \
+  --host 127.0.0.1 --port 1502 --unit-id 1 read-all-measures
+```
+
+写后读回的仿真验证：
+
+```bash
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli \
+  --host 127.0.0.1 --port 1502 set-light --channel 1 --on
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli \
+  --host 127.0.0.1 --port 1502 set-exposure-mode --channel 1 --auto
+build/cls-ltdrv-test/cls/eth_modbus_cch_cli \
+  --host 127.0.0.1 --port 1502 read-channel-param --channel 1
+```
+
+通过标准：CLI 返回 0，仿真器日志出现对应 Modbus 请求，无超时、异常响应
+或协议错误。
+
+### 4.2 Python 仿真器 + C CLI
+
+终端 1：
+
+```bash
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+CCH_PY_SIM="$ETH_PY_ROOT/src/cch/simulator/cli_runner.sh"
+"$CCH_PY_SIM" --host 127.0.0.1 --port 1502 --unit-id 1 --verbose
+```
+
+终端 2 执行与 4.1 相同的 C CLI 命令。通过标准不变，并应在 Python
+仿真器日志中看到 C CLI 的请求。
+
+可选的 Python 客户端互操诊断：
+
+```bash
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+CCH_PY_CLI="$ETH_PY_ROOT/src/cch/cli_runner.sh"
+"$CCH_PY_CLI" --host 127.0.0.1 --port 1502 read-temp
+```
+
+该命令不经过 CLS C 业务路径，不作为 CLS 验收结论。
+
+### 4.3 仿真器常用能力
+
+C 和 Python CCH 仿真器均支持配置、hardware profile、延迟和故障注入。
+以 C 仿真器为例：
+
+```bash
+build/cls-ltdrv-test/cls/eth_modbus_cch_sim \
+  --config src/subsystem/cls/test/eth/sim/cch/sim_config.json
+build/cls-ltdrv-test/cls/eth_modbus_cch_sim \
+  --host 127.0.0.1 --port 1502 --profile hardware --verbose
+build/cls-ltdrv-test/cls/eth_modbus_cch_sim \
+  --host 127.0.0.1 --port 1502 \
+  --fault-after 3 --fault-action exception --fault-exception-code 2
+```
+
+配置优先级为：
+
+```text
+代码默认值 < JSON 配置文件 < 命令行参数
+```
+
+## 5. GPB 交付件编译和部署
+
+### 5.1 编译并检查完整包
+
+先按项目标准入口构建 GPB 完整包：
+
+```bash
+./build_potb.sh -p potb -b gpb
+```
+
+随后检查交付件：
+
+```bash
+CLS_PKG=output/potb/release/HELF-GPB_PACKAGE
+test -x "$CLS_PKG/RUN/SUBSYS/CLS/bin/eth_modbus_cch_cli"
+test -x "$CLS_PKG/RUN/SUBSYS/CLS/bin/eth_modbus_cch_sim"
+test -x "$CLS_PKG/RUN/SUBSYS/CLS/bin/eth_cch_gpb_test"
+test -f "$CLS_PKG/RUN/SUBSYS/CLS/share/cch_requirements.md"
+file "$CLS_PKG/RUN/SUBSYS/CLS/bin/eth_modbus_cch_cli"
+file "$CLS_PKG/RUN/SUBSYS/CLS/bin/eth_modbus_cch_sim"
+file "$CLS_PKG/RUN/SUBSYS/CLS/bin/eth_cch_gpb_test"
+```
+
+预期三个程序都是 AArch64 ELF。工具是动态链接产物，必须部署完整
+`HELF-GPB_PACKAGE`，不得只复制可执行文件或单个 `.so`。
+
+完整包构建后，在独立目录进行 standalone 补充编译；该构建用于本机测试、
+仿真和后续章节的工具产物，不会覆盖 GPB 构建目录或完整包：
+
+```bash
+cmake -S src/subsystem/cls/test/eth -B build/cls-ltdrv-test \
+  -DBUILD_TESTING=ON \
+  -DCLS_TEST_JSON_REPORT=OFF
+cmake --build build/cls-ltdrv-test
+```
+
+另一种选择是由支持直接传入产品 CMake 参数的流水线或构建入口启用两级门禁，
+使以太网测试工具随 GPB 包安装：
+
+```text
+CLS_BUILD_TEST=ON
+CLS_BUILD_ETH=ON
+```
+
+标准 `build_potb.sh` 当前不提供这两个开关的命令行透传；只有流水线或其他
+构建入口实际传入它们时，上述工具才会进入完整包。若完整包检查未找到工具，
+不能以 standalone 补充编译替代该交付件验证，应先确认门禁的传入方式。
+
+### 5.2 传输到 GPB
+
+`HELF-GPB_PACKAGE` 统一通过 PC 上的 AutoScripts `git_mm_runner.ps1` 传输，固定链路为
+`Linux Build <-> PC 暂存区 <-> GPB`。现场 SSH 别名和制品路径配置在本机私有的
+`git_mm_local.json`；先替换其中的 `REPLACE_WITH_*` 占位符。传输流程的配置、
+失败保留物和反向报告收集规则见 [CLS GPB 以太网测试部署公共基准](../CLS-GPB以太网测试部署与运行SOP.md#3-传输-helf-gpb_package-到-gpb)。
+
+```powershell
+& ~/000_gits/AutoScripts/src/git_ops/code_repos/git_mm_runner.ps1 `
+  --profile pd-gpb --dry-run deploy
+& ~/000_gits/AutoScripts/src/git_ops/code_repos/git_mm_runner.ps1 `
+  --profile pd-gpb deploy
+```
+
+传输成功后，完整包应位于 GPB 的 `/tmp/HELF-GPB_PACKAGE`。`git_mm deploy` 不执行
+安装、覆盖、重启或配置修改。
+
+### 5.3 现场安装
+
+登录 GPB 后先查询现场安装工具，不猜测安装、覆盖或重启参数：
+
+```bash
+ssh REPLACE_WITH_GPB_SSH_ALIAS
+helf_install --help
+helf_install run --help
+```
+
+按该 GPB 返回的帮助和现场升级规范安装完整包。安装或替换 RUN 包
+会影响正在运行的产品，必须先确认可停机且可回退。安装后检查：
+
+```bash
+test -x /helf/subsystem/cls/bin/cls_mng
+test -x /helf/subsystem/cls/bin/eth_modbus_cch_cli
+test -x /helf/subsystem/cls/bin/eth_modbus_cch_sim
+test -x /helf/subsystem/cls/bin/eth_cch_gpb_test
+test -f /helf/subsystem/cls/share/cch_requirements.md
+cat /tmp/helf_install_cls.info
+if command -v ldd >/dev/null 2>&1; then
+  ldd /helf/subsystem/cls/bin/eth_modbus_cch_cli
+  ldd /helf/subsystem/cls/bin/eth_modbus_cch_sim
+  ldd /helf/subsystem/cls/bin/eth_cch_gpb_test
+fi
+```
+
+GPB 没有 `ldd` 时记录“命令不存在”，以程序启动错误和板卡现有等价工具
+检查。`ldd` 出现 `not found` 时先检查完整包和现场库搜索路径，不从编译机
+随意复制单个库。
+
+## 6. GPB 产品 API 分级测试
+
+`eth_cch_gpb_test` 在 GPB 上调用 `CLS_LTSensor_Init()` 和公开
+`LTSensor_Open/GetCfgData/SetCfgData/Close` 接口，读取板上实际生效配置。
+它不接受 `--host` 或 `--port`；需要切换仿真器或实物地址时，先备份并修改
+GPB 生效配置，按现场规范重启相关进程，测试结束后恢复。
+
+`--target sim|real` 只写入报告 metadata，不改变连接地址。隔离测试前必须停止
+`cls_mng` 和其他 CCH 使用者，避免多个进程同时连接设备。准备报告目录：
+
+```bash
+CLS_BIN=/helf/subsystem/cls/bin
+CCH_GPB_REPORT=/tmp/cls-cch-gpb
+mkdir -p "$CCH_GPB_REPORT"
+```
+
+### 6.1 第一级：只读
+
+外部仿真器或实物已按生效配置就绪后执行：
+
+```bash
+"$CLS_BIN/eth_cch_gpb_test" read \
+  --target sim \
+  --report-path "$CCH_GPB_REPORT/cch_gpb_read.suite.json"
+```
+
+连接实物时只将 `--target` 改为 `real`。通过标准为进程返回 0、报告
+`failed=0`、`authorization_level=read`；所有写记录必须为 `skipped`。第一级
+失败时不得继续写测试。
+
+### 6.2 第二级：全部可恢复写
+
+只允许停机、脱离生产或活动工艺的实验室设备执行：
+
+```bash
+"$CLS_BIN/eth_cch_gpb_test" write \
+  --target sim \
+  --allow-real-writes \
+  --report-path "$CCH_GPB_REPORT/cch_gpb_write.suite.json"
+```
+
+程序对全部安全设置执行“读原值、写小幅测试值、回读、恢复、再次回读”。
+任一写入、验证或恢复失败后，后续写操作会被保护。通过标准为返回 0、
+`failed=0`，所有实际写入记录均同时包含 `write_verified=true` 和
+`restore_verified=true`。报告旁的 `.recovery.json` 必须为
+`status=complete`。
+
+### 6.3 第三级：逐项 dangerous-write
+
+危险动作不能批量执行。每次必须指定一个动作，同时提供危险写开关和完整确认
+短语。除 `save-parameters` 外都必须显式指定 `--channel 1..16`：
+
+```bash
+# 保存当前已恢复参数到 flash；不可回滚
+"$CLS_BIN/eth_cch_gpb_test" dangerous-write \
+  --target real --action save-parameters \
+  --allow-dangerous-writes \
+  --confirm-dangerous-write I_UNDERSTAND_CCH_DANGEROUS_WRITE \
+  --report-path "$CCH_GPB_REPORT/cch_gpb_dangerous_save.suite.json"
+
+# 示例：通道 1 位置清零；程序会回读并恢复原开关状态
+"$CLS_BIN/eth_cch_gpb_test" dangerous-write \
+  --target real --action zero-position --channel 1 \
+  --allow-dangerous-writes \
+  --confirm-dangerous-write I_UNDERSTAND_CCH_DANGEROUS_WRITE \
+  --report-path "$CCH_GPB_REPORT/cch_gpb_dangerous_zero.suite.json"
+```
+
+可选动作完整集合为 `save-parameters`、`zero-position`、
+`dark-calibration`、`cache-image`、`cache-dark-table`。程序先完成只读前置
+检查，只执行所选动作；错误确认短语、缺少通道或缺少授权时会在设备初始化前
+失败。`save-parameters` 和 `dark-calibration` 无法恢复旧状态，报告只证明命令
+被接受且设备恢复可读，不得解释为状态已恢复。每项危险测试必须使用独立报告
+文件并由现场负责人逐项授权。
+
+### 6.4 收集正式报告
+
+从编译机复制 GPB raw 报告和恢复状态文件：
+
+```bash
+GPB_USER=REPLACE_WITH_GPB_USER
+GPB_IP=REPLACE_WITH_GPB_MANAGEMENT_IP
+LOCAL_RAW="$PWD/build/cls-ltdrv-report-test/reports/gpb-cch/raw"
+mkdir -p "$LOCAL_RAW"
+scp "$GPB_USER@$GPB_IP:/tmp/cls-cch-gpb/*.suite.json" "$LOCAL_RAW/"
+scp "$GPB_USER@$GPB_IP:/tmp/cls-cch-gpb/*.recovery.json" "$LOCAL_RAW/"
+```
+
+只将 `*.suite.json` 交给 ETH-PY runner。read、write 和各危险动作使用不同
+suite 名，可以放在同一 raw 目录汇总。`.recovery.json` 作为现场恢复证据单独
+归档。
+
+## 7. GPB C 工具自环
+
+CCH 自环使用独立端口 `1502`，通常不需要停止 `cls_mng`。
+
+GPB 终端 1：
+
+```bash
+CLS_BIN=/helf/subsystem/cls/bin
+"$CLS_BIN/eth_modbus_cch_sim" \
+  --host 127.0.0.1 --port 1502 --unit-id 1 --verbose
+```
+
+GPB 终端 2：
+
+```bash
+CLS_BIN=/helf/subsystem/cls/bin
+"$CLS_BIN/eth_modbus_cch_cli" \
+  --host 127.0.0.1 --port 1502 --unit-id 1 read-temp
+"$CLS_BIN/eth_modbus_cch_cli" \
+  --host 127.0.0.1 --port 1502 --unit-id 1 read-measure --channel 1
+```
+
+通过标准：CLI 返回成功，sim 日志出现对应请求，无动态库、超时或
+协议错误。该结论只证明 GPB C 工具链路。
+
+## 8. GPB 连接外部仿真器的产品测试
+
+### 8.1 找到并备份实际配置
+
+源码默认配置位于：
+
+```text
+src/subsystem/cls/src/config/potb/machine_4gpb/slot2/SensorCfg.json
+src/subsystem/cls/src/config/potb/machine_4gpb/slot2/EthDeviceListCfg_CLS_CP.json
+```
+
+安装脚本通常部署到 `/helf/subsystem/cls/config`，但板级或用户配置可能
+覆盖它。在 GPB 上查找并记录实际生效文件：
+
+```bash
+find /helf/subsystem/cls/config /root/helf_board_cfg "$HOME/helf_user_cfg" \
+  \( -name 'SensorCfg.json' -o -name 'EthDeviceListCfg_CLS_CP.json' \) \
+  2>/dev/null
+```
+
+CCH 为 `SensorCfgItem=0`。先在仓库外备份生效配置，再将 CCH 条目的
+`ServerIP` 设为辅助机可达 IP，`ServerPort` 设为 `1502`；测试后
+必须恢复原文件。
+
+### 8.2 辅助机运行 C 仿真器
+
+在辅助机的完整 pd checkout 构建并启动：
+
+```bash
+cmake -S src/subsystem/cls/test/eth -B build/cls-ltdrv-test \
+  -DBUILD_TESTING=ON -DCLS_TEST_JSON_REPORT=OFF
+cmake --build build/cls-ltdrv-test
+build/cls-ltdrv-test/cls/eth_modbus_cch_sim \
+  --host 0.0.0.0 --port 1502 --unit-id 1 --verbose
+```
+
+### 8.3 辅助机运行 Python 仿真器
+
+与 7.2 二选一，不要让两个仿真器抢占同一端口：
+
+```bash
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+CCH_PY_SIM="$ETH_PY_ROOT/src/cch/simulator/cli_runner.sh"
+test -x "$CCH_PY_SIM"
+"$CCH_PY_SIM" --host 0.0.0.0 --port 1502 --unit-id 1 --verbose
+```
+
+### 8.4 执行产品路径并判定
+
+按 `helf_install run --help` 和现场规范重启相关进程，由实际业务入口调用：
+
+```text
+CLS_LTSensor_Init()
+OpenSensor(CLS_SENSOR_CCH)
+ReadSensorData(CLS_SENSOR_CCH) / ReadMiscSensorData(...)
+GetSensorCfgData(...) / SetSensorCfgData(...)
+```
+
+辅助机仿真器日志必须出现来自 GPB 设备网 IP 的请求，业务入口
+必须返回有效数据。只有 TCP 建连、CLI 成功或 `Subsystem init DONE` 都不足以
+判定产品路径通过。保存业务返回值、仿真器日志、生效配置路径和
+测试时间。
+
+## 9. CCH 实物测试
+
+### 9.1 安全前置和产品路径
+
+记录但不提交设备 IP、端口、Unit ID、超时、生效配置路径、测试人和
+恢复确认人。默认先执行只读测试；任何写测试均只能用于停机、脱离
+生产或活动工艺的实验室设备。
+
+产品路径测试时，将 CCH 生效配置的 `ServerIP`/`ServerPort` 设为
+实物参数，由实际业务入口初始化、打开并读取 CCH。通过标准为业务
+返回成功且数据合理；测量值为 `None` 时先检查通道、光源、曝光、被测物和
+设备工作状态，不直接判定通信失败。
+
+### 9.2 隔离 CLI 只读诊断
+
+CLI 与业务进程不得同时访问设备。先按现场命令停止同协议业务访问，
+再在 GPB 执行：
+
+```bash
+CLS_BIN=/helf/subsystem/cls/bin
+CCH_HOST=REPLACE_WITH_CCH_IP
+"$CLS_BIN/eth_modbus_cch_cli" \
+  --host "$CCH_HOST" --port 502 --unit-id 1 read-temp
+"$CLS_BIN/eth_modbus_cch_cli" \
+  --host "$CCH_HOST" --port 502 --unit-id 1 read-measure --channel 1
+"$CLS_BIN/eth_modbus_cch_cli" \
+  --host "$CCH_HOST" --port 502 --unit-id 1 read-channel-param --channel 1
+"$CLS_BIN/eth_modbus_cch_cli" \
+  --host "$CCH_HOST" --port 502 --unit-id 1 read-all-measures
+```
+
+命令必须在 timeout 内成功返回，通道号和数据行应与设备状态一致。
+
+### 9.3 第一级：自动化实物只读报告
+
+先完成 3.2 的报告构建。现场设备配置必须位于仓库外：
+
+```bash
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+REPORT_RUNNER="$ETH_PY_ROOT/src/reporting/cli_runner.sh"
+REAL_READ_RAW="$PWD/build/cls-ltdrv-report-test/reports/real-read-only/raw"
+mkdir -p "$REAL_READ_RAW"
+
+build/cls-ltdrv-report-test/cases/cls_cch_requirement_tests \
+  --device-mode=real \
+  --device-config /path/outside/repo/lab-device.json \
+  --report-path "$REAL_READ_RAW/cch_requirements.suite.json"
+"$REPORT_RUNNER" "$REAL_READ_RAW"
+```
+
+必须确认进程返回 0，报告 metadata 为 `device_mode=real`、
+`allow_real_writes=false`，纯读记录通过，写记录为 `skipped`，且
+`failed=0`。任何失败都必须停止，不得继续第二级。
+
+### 9.4 第二级：授权后的可恢复写
+
+只有现场负责人在第一级通过后明确开放写入，才可执行：
+
+```bash
+ETH_PY_ROOT=${ETH_PY_ROOT:-"$HOME/000_gits/ETH-PY"}
+REPORT_RUNNER="$ETH_PY_ROOT/src/reporting/cli_runner.sh"
+REAL_WRITE_RAW="$PWD/build/cls-ltdrv-report-test/reports/real-write/raw"
+mkdir -p "$REAL_WRITE_RAW"
+
+build/cls-ltdrv-report-test/cases/cls_cch_requirement_tests \
+  --device-mode=real \
+  --device-config /path/outside/repo/lab-device.json \
+  --allow-real-writes \
+  --report-path "$REAL_WRITE_RAW/cch_requirements.suite.json"
+"$REPORT_RUNNER" "$REAL_WRITE_RAW"
+```
+
+每个允许的设置都必须完成“读原值、写安全测试值、回读、恢复原值、再回读”。
+报告中写后验证和恢复验证必须均为 true。即使开放了第二级，下列动作
+仍必须是 `skipped`：
+
+- 保存参数；
+- 通道位置清零；
+- 暗校准；
+- 通道图像缓存；
+- 暗校准表缓存。
+
+如运行中断、写后验证失败或恢复验证失败，立即停止后续写入，按报告
+`before`、`restore_written` 和 `restore_after` 字段人工恢复并再次读取确认。
+
+## 10. 收尾、证据和排障
+
+### 10.1 每次测试的必留证据
+
+- pd 和 ETH-PY 的 commit ID（使用 Python 仿真器或报告转换时）；
+- 构建命令、CTest 结果和正式 JSON/HTML；
+- GPB 包版本、生效配置路径、业务返回值和仿真器/设备日志；
+- 实物原值、授权人、恢复结果、测试人和时间。
+
+测试结束后停止仿真器，恢复 GPB 生效配置和实物参数，再按现场规范
+恢复业务进程。
+
+### 10.2 排障顺序
+
+1. `file` 确认 GPB 产物是 AArch64。
+2. `ldd` 或启动错误确认动态库完整。
+3. `ip addr`、`ping` 确认网卡、路由和地址。
+4. `ss -ltnp` 确认仿真器监听和端口占用。
+5. 仿真器/CLI 日志确认 TCP、Unit ID 和 Modbus 请求。
+6. `/tmp/cls_mng.log`、`/helflog/current/app` 和业务返回值确认实际产品路径。
+
+常见问题：
+
+- 监听 `502` 失败：Linux 低端口通常需要特权；仿真联调改用 `1502`。
+- 连接超时：检查监听、防火墙、路由、host/port 和业务生效配置。
+- Unit ID 无响应：启用 `--strict-unit-id` 时客户端必须与仿真器一致。
+- 实物写后异常：立即停止写入，使用测试前记录的原值恢复并回读；无法
+  恢复时交现场设备负责人处理。
+
+公共规范参考：[CLS GPB 以太网测试部署公共基准](../CLS-GPB以太网测试部署与运行SOP.md)、
+[CLS ltdrv 测试报告 SOP](../CLS-ltdrv测试报告SOP.md) 和
+[设备接口测试策略](../设备接口测试策略.md)。
