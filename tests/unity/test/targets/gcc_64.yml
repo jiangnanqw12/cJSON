@@ -1,50 +1,223 @@
-compiler:
-  path: gcc
-  source_path:     '../src/'
-  unit_tests_path: &unit_tests_path 'tests/'
-  build_path:      &build_path 'build/'
-  options:
-    - '-c'
-    - '-m64'
-    - '-Wall'
-    - '-Wno-address'
-    - '-std=c99'
-    - '-pedantic'
-  includes:
-    prefix: '-I'
-    items:
-      - 'src/'
-      - '../src/'
-      - 'testdata/'
-      - *unit_tests_path
-  defines:
-    prefix: '-D'
-    items:
-      - UNITY_EXCLUDE_STDINT_H
-      - UNITY_EXCLUDE_LIMITS_H
-      - UNITY_INCLUDE_DOUBLE
-      - UNITY_SUPPORT_TEST_CASES
-      - UNITY_SUPPORT_64
-      - UNITY_INT_WIDTH=32
-      - UNITY_LONG_WIDTH=64
-  object_files:
-    prefix: '-o'
-    extension: '.o'
-    destination: *build_path
-linker:
-  path: gcc
-  options:
-    - -lm
-    - '-m64'
-  includes:
-    prefix: '-I'
-  object_files:
-    path: *build_path
-    extension: '.o'
-  bin_files:
-    prefix: '-o'
-    extension: '.exe'
-    destination: *build_path
-colour: true
-:unity:
-  :plugins: []
+"""Build an embedded UTF-8 Q2 bundle; uses only the host Python standard library.
+
+Framing and encoding detection follow q2/src/plot_q_data.py. All decoded text
+uses LF so q2's universal-newline bundle reader cannot invalidate frame sizes.
+QR image generation is not needed for the transparent TCP link.
+"""
+import argparse
+from collections import deque
+import os
+import json
+import tempfile
+from pathlib import Path
+import sys
+
+MAX_FRAME_CHARS = 1500
+FALLBACK_ENCODINGS = ("gb18030", "gbk", "gb2312", "cp936")
+
+
+def read_text(path):
+    try:
+        # Match q2's UTF-8 universal-newline read, including BOM preservation.
+        with path.open("r", encoding="utf-8") as source:
+            return source.read()
+    except UnicodeDecodeError:
+        raw = path.read_bytes()
+    for encoding in FALLBACK_ENCODINGS:
+        try:
+            return raw.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
+        except UnicodeDecodeError:
+            pass
+    raise ValueError(f"cannot decode text file: {path}")
+
+
+def payload(path, index, total, body):
+    header = f"Q2_BEGIN path={path} part={index}/{total} size={len(body)}"
+    return f"{header}\n{body}\nQ2_END" if body else f"{header}\nQ2_END"
+
+
+def bodies_for_total(path, data, limit, total):
+    segments = deque(data.splitlines(keepends=True))
+    bodies = []
+    body = ""
+    while segments:
+        index = len(bodies) + 1
+        segment = segments.popleft()
+        if len(payload(path, index, total, body + segment)) <= limit:
+            body += segment
+            continue
+        if body:
+            bodies.append(body)
+            body = ""
+            segments.appendleft(segment)
+            continue
+        low, high, best = 1, len(segment), 0
+        while low <= high:
+            middle = (low + high) // 2
+            if len(payload(path, index, total, segment[:middle])) <= limit:
+                best, low = middle, middle + 1
+            else:
+                high = middle - 1
+        if best == 0:
+            raise ValueError(f"path too long for a {limit}-character Q2 frame: {path}")
+        bodies.append(segment[:best])
+        if best < len(segment):
+            segments.appendleft(segment[best:])
+    if body or not bodies:
+        bodies.append(body)
+    return bodies
+
+
+def frames(path, data, limit=MAX_FRAME_CHARS):
+    total = 1
+    while True:
+        bodies = bodies_for_total(path, data, limit, total)
+        if len(bodies) == total:
+            result = [payload(path, i + 1, total, body) for i, body in enumerate(bodies)]
+            if any(len(frame) > limit for frame in result):
+                raise ValueError(f"path too long for a {limit}-character Q2 frame: {path}")
+            return result
+        total = len(bodies)
+
+
+def discover(directory, extensions, recursive, output=None):
+    root = Path(directory).expanduser()
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"input must be a directory, not a symlink: {root}")
+    selected = set()
+    for extension in extensions:
+        if not isinstance(extension, str):
+            raise ValueError("extensions entries must be strings")
+        extension = extension.strip().lower()
+        if not extension or any(c in extension for c in "/\\\r\n"):
+            raise ValueError("extensions must be non-empty filename suffixes")
+        selected.add(extension if extension.startswith(".") else "." + extension)
+    found = []
+
+    def walk_error(error):
+        raise error
+
+    for current, dirs, names in os.walk(root, onerror=walk_error, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not (Path(current) / d).is_symlink()) if recursive else []
+        for name in names:
+            candidate = Path(current) / name
+            if candidate.is_symlink() or not candidate.is_file() or candidate.suffix.lower() not in selected:
+                continue
+            if output is not None and candidate.resolve() == output.resolve():
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            # Q2's header is a single line; backslash is also ambiguous on Windows restore.
+            if any(ord(c) < 32 for c in relative) or "\\" in relative:
+                raise ValueError(f"unsupported Q2 path: {relative!r}")
+            found.append((relative, candidate))
+    if not found:
+        raise ValueError(f"no files match the selected extensions in {root}")
+    return sorted(found)
+
+
+def cpp_string(value):
+    # Fixed-width octal escapes cannot consume the next character like \x can.
+    return '"' + "".join(f"\\{byte:03o}" for byte in value.encode("utf-8")) + '"'
+
+
+def generate(directory, extensions, recursive, output=None):
+    entries, bundle = [], bytearray()
+    for relative, path in discover(directory, extensions, recursive, output):
+        try:
+            text = read_text(path)
+            if "\0" in text:
+                raise ValueError("NUL is not supported in text input")
+            chunks = frames(relative, text)
+        except (UnicodeError, ValueError, OSError) as error:
+            raise ValueError(f"{path}: {error}") from error
+        entries.append(f"    {{{cpp_string(relative)}, {len(text.encode('utf-8'))}U, {len(chunks)}U}},")
+        for chunk in chunks:
+            bundle.extend(chunk.encode("utf-8"))
+            bundle.append(10)
+    lines = ['#include "embedded_text.hpp"', 'namespace mvs::text {', 'const File files[] = {']
+    lines.extend(entries or ['    {nullptr, 0U, 0U},'])
+    lines.extend(['};', f'const std::size_t fileCount = {len(entries)}U;', 'const unsigned char bundle[] = {'])
+    for offset in range(0, len(bundle), 24):
+        lines.append("    " + ",".join(str(b) for b in bundle[offset:offset + 24]) + ",")
+    if not bundle:
+        lines.append("    0,")
+    lines.extend(['};', f'const std::size_t bundleSize = {len(bundle)}U;', '} // namespace mvs::text', ''])
+    return "\n".join(lines)
+
+
+DEFAULT_OUTPUT = "../../pd/src/subsystem/mvs/verification/resources/embedded_text.cpp"
+
+
+def load_config(config_path):
+    config_path = Path(config_path).expanduser().resolve()
+    config = {}
+    layers = [config_path]
+    local = config_path.with_name(config_path.stem + "_local" + config_path.suffix)
+    if not config_path.stem.endswith("_local") and local.exists():
+        layers.append(local)
+    for selected in layers:
+        with selected.open(encoding="utf-8-sig") as stream:
+            values = json.load(stream)
+        if not isinstance(values, dict):
+            raise ValueError(f"config must be a JSON object: {selected}")
+        unknown = set(values) - {"input_dir", "extensions", "recursive", "output_cpp"}
+        if unknown:
+            raise ValueError(f"unknown config fields in {selected}: " + ", ".join(sorted(unknown)))
+        config.update(values)
+    input_dir = config.get("input_dir", "")
+    output_cpp = config.get("output_cpp", DEFAULT_OUTPUT)
+    for name, value in (("input_dir", input_dir), ("output_cpp", output_cpp)):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty path; edit {config_path}")
+    extensions = config.get("extensions", [".txt"])
+    if not isinstance(extensions, list) or not extensions:
+        raise ValueError("extensions must be a non-empty JSON array of suffixes")
+    recursive = config.get("recursive", True)
+    if not isinstance(recursive, bool):
+        raise ValueError("recursive must be true or false")
+
+    def absolute(value):
+        path = Path(value).expanduser()
+        # Keep the leaf unresolved so discover can reject a symlink input root.
+        return path if path.is_absolute() else config_path.parent / path
+
+    return absolute(input_dir), extensions, recursive, absolute(output_cpp)
+
+
+def write_output(output, content):
+    if output.is_symlink():
+        raise ValueError(f"output must not be a symlink: {output}")
+    encoded = content.encode("utf-8")
+    if output.exists() and output.read_bytes() == encoded:
+        return False
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=output.parent, prefix=".text-to-array-", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(encoded)
+        temporary.replace(output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return True
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path,
+                        default=Path(__file__).resolve().parent / "config.json")
+    args = parser.parse_args(argv)
+    try:
+        source, extensions, recursive, output = load_config(args.config)
+        content = generate(source, extensions, recursive, output)
+        changed = write_output(output, content)
+    except (ValueError, OSError, UnicodeError) as error:
+        print(f"text-to-array: {error}", file=sys.stderr)
+        return 1
+    print(f"{'Generated' if changed else 'Unchanged'}: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
