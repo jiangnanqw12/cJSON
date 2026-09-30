@@ -1,11 +1,12 @@
-# Security Policy
-
-## Supported Versions
-
-Security is of the highest importance and all security vulnerabilities or suspected security vulnerabilities should be reported to cjson team privately, to minimize attacks against current users of cjson before they are fixed. Vulnerabilities will be investigated and patched on the next patch (or minor) release as soon as possible. This information could be kept entirely internal to the project.
-
-## Reporting a Vulnerability
-
-If you know of a publicly disclosed security vulnerability for cjson, please IMMEDIATELY contact wp_scut@163.com and peterlee@apache.org to inform the cjson Team.
-
-IMPORTANT: Do not file public issues on GitHub for security vulnerabilities.
+{
+  "input_dir": "",
+  "extensions": [
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".tpp",
+    ".py", ".pyi", ".pyw",
+    ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml", ".properties",
+    ".cmake", ".mk", ".mak", ".in", ".sh", ".bash", ".bat", ".cmd", ".ps1",
+    ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".log"
+  ],
+  "recursive": true,
+  "output_cpp": "../../../pd/src/subsystem/mvs/verification/resources/embedded_text.cpp"
+}
