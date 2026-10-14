@@ -1,22 +1,540 @@
-bf{
-    "glossary": {
-        "title": "example glossary",
-		"GlossDiv": {
-            "title": "S",
-			"GlossList": {
-                "GlossEntry": {
-                    "ID": "SGML",
-					"SortAs": "SGML",
-					"GlossTerm": "Standard Generalized Markup Language",
-					"Acronym": "SGML",
-					"Abbrev": "ISO 8879:1986",
-					"GlossDef": {
-                        "para": "A meta-markup language, used to create markup languages such as DocBook.",
-						"GlossSeeAlso": ["GML", "XML"]
-                    },
-					"GlossSee": "markup"
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <set>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+struct Poly;
+
+namespace rectangle_layers_detail {
+void solveWithDeadline(const std::vector<Poly>& input,
+                       std::vector<Poly>& layer1,
+                       std::vector<Poly>& layer2,
+                       std::vector<Poly>& layer3,
+                       std::chrono::steady_clock::time_point end);
+}
+
+// 坐标点
+struct Point { int x, y; };
+
+// 矩形: 左上角 + 右下角（包含端点）
+// 坐标精度为 0.1 单位，存储为整数（即实际值 = 存储值 / 10）
+struct Poly {
+    Point topLeft;      // 左上角
+    Point bottomRight; // 右下角
+};
+
+// 选手在此实现分组算法。
+//
+// 功能: 将 input 中的所有矩形拆分到 layer1 / layer2 / layer3 三层，
+//       使得同一层内任意两个矩形之间的最小欧氏距离 >= 1500（固定值）。
+//
+// 参数:
+//   input  - 输入矩形列表（只读）
+//   layer1 - 输出: 第一层矩形（引用），出参，初始是空的 vector
+//   layer2 - 输出: 第二层矩形（引用），出参，初始是空的 vector
+//   layer3 - 输出: 第三层矩形（引用），出参，初始是空的 vector
+//
+// 约束:
+//   1. layer1 + layer2 + layer3 必须恰好等于 input（不多不少、无重复）
+//   2. 同一层内任意两矩形的最小距离 >= 1500
+//   3. 至少一层非空
+//   4. 不允许向 stdout 打印任何内容
+//   5. 修改 input 的值无效（判题使用原始数据副本）
+//
+// 示例（test_example）：
+// 标准输入（第一行为矩形数量 n，后续每行 4 个整数 xMin yMin xMax yMax）：
+//   9
+//   2730 2497 2765 2547
+//   1849 107 1893 139
+//   380 1692 429 1730
+//   493 1559 535 1609
+//   2371 2587 2416 2632
+//   1459 290 1490 335
+//   458 2094 500 2129
+//   1929 785 1967 835
+//   2012 2427 2043 2460
+//
+// 读取、调用 Solve 及判题的完整流程:
+//   int n;
+//   std::cin >> n;                        // 读取矩形数量
+//   std::vector<Poly> inPolys;
+//   inPolys.reserve(n);
+//   for (int i = 0; i < n; i++) {
+//       int xMin, yMin, xMax, yMax;
+//       std::cin >> xMin >> yMin >> xMax >> yMax;   // 读取第 i 个矩形
+//       Poly p;
+//       p.topLeft = { xMin, yMax };        // 左上角 = (xMin, yMax)
+//       p.bottomRight = { xMax, yMin };    // 右下角 = (xMax, yMin)
+//       inPolys.push_back(p);
+//   }
+//
+//   std::vector<Poly> inPolysCopy = inPolys;        // 保存原始数据副本
+//   std::vector<Poly> layer1, layer2, layer3;
+//   Solve(inPolys, layer1, layer2, layer3);        // 选手算法
+//
+//   // 判题: 用 inPolysCopy（原始副本）验证，选手修改 input 无效
+//   _Judge(layer1, layer2, layer3, inPolysCopy);
+//
+// 一种合法的拆分结果（按 input 索引）：
+//   layer1 = { input[0], input[1], input[2] }
+//   layer2 = { input[3], input[4], input[5] }
+//   layer3 = { input[6], input[7], input[8] }
+//
+void Solve(
+    const std::vector<Poly>& input,
+    std::vector<Poly>& layer1,
+    std::vector<Poly>& layer2,
+    std::vector<Poly>& layer3)
+{
+    const int DIST = 1500;
+    const int n = (int)input.size();
+    const long long DIST2 = (long long)DIST * DIST;  // Euclidean: dx^2+dy^2 < DIST^2
+
+    if (n == 0) {
+        return;
+
+    }
+
+    static_assert(DIST2 == 2250000, "Unsupported distance threshold");
+    const std::chrono::steady_clock::time_point end =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(5500);
+    rectangle_layers_detail::solveWithDeadline(input, layer1, layer2, layer3, end);
+}
+
+class NoSolutionError : public std::runtime_error {
+public:
+    NoSolutionError() : std::runtime_error("No three-layer grouping exists") {}
+};
+
+class TimeLimitError : public std::runtime_error {
+public:
+    TimeLimitError() : std::runtime_error("Three-layer solver time limit exceeded") {}
+};
+
+namespace rectangle_layers_detail {
+
+typedef std::size_t Vertex;
+typedef std::vector<std::vector<Vertex> > Graph;
+typedef std::chrono::steady_clock Clock;
+
+class Deadline {
+public:
+    explicit Deadline(Clock::time_point end) : end_(end), ticks_(0) {}
+
+    void check() const {
+        if (Clock::now() >= end_) {
+            throw TimeLimitError();
+        }
+    }
+
+    void poll() {
+        if (++ticks_ == 256) {
+            ticks_ = 0;
+            check();
+        }
+    }
+
+private:
+    Clock::time_point end_;
+    unsigned ticks_;
+};
+
+struct Cell {
+    std::int64_t x;
+    std::int64_t y;
+
+    bool operator==(const Cell& other) const {
+        return x == other.x && y == other.y;
+    }
+};
+
+struct CellHash {
+    static std::uint64_t mix(std::uint64_t x) {
+        x += UINT64_C(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+        return x ^ (x >> 31);
+    }
+
+    std::size_t operator()(const Cell& cell) const {
+        return static_cast<std::size_t>(
+            mix(static_cast<std::uint64_t>(cell.x)) ^
+            mix(mix(static_cast<std::uint64_t>(cell.y))));
+    }
+};
+
+struct Bucket {
+    std::array<Vertex, 3> vertices;
+    unsigned count;
+
+    Bucket() : vertices(), count(0) {}
+};
+
+std::int64_t cellCoordinate(int value) {
+    const std::int64_t wide = value;
+    return wide >= 0 ? wide / 1000 : -((-wide + 999) / 1000);
+}
+
+bool conflict(const Poly& a, const Poly& b) {
+    const std::int64_t dx = std::max<std::int64_t>(0,
+        std::max(static_cast<std::int64_t>(a.topLeft.x) - b.bottomRight.x,
+                 static_cast<std::int64_t>(b.topLeft.x) - a.bottomRight.x));
+    const std::int64_t dy = std::max<std::int64_t>(0,
+        std::max(static_cast<std::int64_t>(a.bottomRight.y) - b.topLeft.y,
+                 static_cast<std::int64_t>(b.bottomRight.y) - a.topLeft.y));
+    return dx < 1500 && dy < 1500 && dx * dx + dy * dy < 2250000;
+}
+
+Graph buildGraph(const std::vector<Poly>& input, Deadline& budget) {
+    Graph graph(input.size());
+    std::unordered_map<Cell, Bucket, CellHash> cells;
+    cells.reserve(std::min<std::size_t>(input.size(), 262144));
+    budget.check();
+    for (Vertex i = 0; i < input.size(); ++i) {
+        budget.poll();
+        const Poly& p = input[i];
+        const std::int64_t width = static_cast<std::int64_t>(p.bottomRight.x) - p.topLeft.x;
+        const std::int64_t height = static_cast<std::int64_t>(p.topLeft.y) - p.bottomRight.y;
+        if (width < 30 || width > 50 || height < 30 || height > 50) {
+            throw std::invalid_argument("Rectangle side lengths must be in [30, 50]");
+        }
+        const Cell cell = {cellCoordinate(p.topLeft.x), cellCoordinate(p.bottomRight.y)};
+        Bucket& bucket = cells[cell];
+        if (bucket.count == 3) {
+            throw NoSolutionError();
+        }
+        for (int x = -2; x <= 2; ++x) {
+            for (int y = -2; y <= 2; ++y) {
+                budget.poll();
+                const Cell neighbor = {cell.x + x, cell.y + y};
+                const auto found = cells.find(neighbor);
+                if (found == cells.end()) {
+                    continue;
+                }
+                for (unsigned j = 0; j < found->second.count; ++j) {
+                    const Vertex other = found->second.vertices[j];
+                    if (conflict(p, input[other])) {
+                        graph[i].push_back(other);
+                        graph[other].push_back(i);
+                    }
                 }
             }
         }
+        bucket.vertices[bucket.count++] = i;
     }
+    budget.check();
+    return graph;
+}
+
+class CoreSearch {
+public:
+    CoreSearch(const Graph& graph, const std::vector<Vertex>& original, Deadline& budget)
+        : graph_(graph), original_(original), budget_(budget), colors_(graph.size(), -1),
+          counts_(graph.size(), std::array<unsigned, 3>{{0, 0, 0}}),
+          saturation_(graph.size(), 0) {
+        for (Vertex v = 0; v < graph.size(); ++v) {
+            budget_.poll();
+            choices_.insert(key(v));
+        }
+    }
+
+    std::vector<int> run() {
+        budget_.check();
+        if (choices_.empty()) {
+            return colors_;
+        }
+        if (!propagate(choices_.begin()->vertex, 0)) {
+            throw NoSolutionError();
+        }
+        std::vector<Frame> frames;
+        while (!choices_.empty()) {
+            budget_.poll();
+            frames.push_back(makeFrame(choices_.begin()->vertex));
+            bool advanced = false;
+            while (!frames.empty()) {
+                budget_.poll();
+                Frame& frame = frames.back();
+                undo(frame.mark);
+                if (frame.next == frame.count) {
+                    frames.pop_back();
+                    continue;
+                }
+                const int color = frame.order[frame.next++];
+                if (propagate(frame.vertex, color)) {
+                    advanced = true;
+                    break;
+                }
+            }
+            if (!advanced) {
+                throw NoSolutionError();
+            }
+        }
+        return colors_;
+    }
+
+private:
+    struct Key {
+        unsigned saturation;
+        std::size_t degree;
+        Vertex original;
+        Vertex vertex;
+    };
+
+    struct HigherPriority {
+        bool operator()(const Key& a, const Key& b) const {
+            if (a.saturation != b.saturation) return a.saturation > b.saturation;
+            if (a.degree != b.degree) return a.degree > b.degree;
+            return a.original < b.original;
+        }
+    };
+
+    struct Frame {
+        Vertex vertex;
+        std::size_t mark;
+        std::array<int, 3> order;
+        unsigned count;
+        unsigned next;
+    };
+
+    Key key(Vertex v) const {
+        const Key result = {saturation_[v], graph_[v].size(), original_[v], v};
+        return result;
+    }
+
+    unsigned available(Vertex v) const {
+        unsigned mask = 0;
+        for (unsigned c = 0; c < 3; ++c) {
+            if (counts_[v][c] == 0) mask |= 1u << c;
+        }
+        return mask;
+    }
+
+    Frame makeFrame(Vertex v) {
+        Frame frame = {v, trail_.size(), {{0, 0, 0}}, 0, 0};
+        std::array<std::pair<std::size_t, int>, 3> ordered;
+        for (int c = 0; c < 3; ++c) {
+            if (counts_[v][c] != 0) continue;
+            std::size_t impact = 0;
+            for (Vertex w : graph_[v]) {
+                budget_.poll();
+                if (colors_[w] == -1 && counts_[w][c] == 0) ++impact;
+            }
+            ordered[frame.count++] = std::make_pair(impact, c);
+        }
+        for (unsigned i = 1; i < frame.count; ++i) {
+            for (unsigned j = i; j > 0 && ordered[j] < ordered[j - 1]; --j) {
+                std::swap(ordered[j], ordered[j - 1]);
+            }
+        }
+        for (unsigned i = 0; i < frame.count; ++i) frame.order[i] = ordered[i].second;
+        return frame;
+    }
+
+    bool assign(Vertex v, int color, std::vector<Vertex>& pending) {
+        if (counts_[v][color] != 0) return false;
+        choices_.erase(key(v));
+        colors_[v] = color;
+        trail_.push_back(v);
+        bool valid = true;
+        for (Vertex w : graph_[v]) {
+            budget_.poll();
+            if (colors_[w] != -1) continue;
+            if (counts_[w][color]++ == 0) {
+                choices_.erase(key(w));
+                ++saturation_[w];
+                choices_.insert(key(w));
+            }
+            if (saturation_[w] == 3) valid = false;
+            if (saturation_[w] == 2) pending.push_back(w);
+        }
+        return valid;
+    }
+
+    bool propagate(Vertex v, int color) {
+        std::vector<Vertex> pending;
+        if (!assign(v, color, pending)) return false;
+        for (std::size_t i = 0; i < pending.size(); ++i) {
+            budget_.poll();
+            const Vertex w = pending[i];
+            if (colors_[w] != -1) continue;
+            const unsigned mask = available(w);
+            if (mask == 0) return false;
+            if ((mask & (mask - 1)) != 0) continue;
+            const int forced = mask == 1 ? 0 : (mask == 2 ? 1 : 2);
+            if (!assign(w, forced, pending)) return false;
+        }
+        return true;
+    }
+
+    void undo(std::size_t mark) {
+        while (trail_.size() > mark) {
+            budget_.poll();
+            const Vertex v = trail_.back();
+            trail_.pop_back();
+            const int color = colors_[v];
+            for (Vertex w : graph_[v]) {
+                budget_.poll();
+                if (colors_[w] != -1) continue;
+                if (--counts_[w][color] == 0) {
+                    choices_.erase(key(w));
+                    --saturation_[w];
+                    choices_.insert(key(w));
+                }
+            }
+            colors_[v] = -1;
+            choices_.insert(key(v));
+        }
+    }
+
+    const Graph& graph_;
+    const std::vector<Vertex>& original_;
+    Deadline& budget_;
+    std::vector<int> colors_;
+    std::vector<std::array<unsigned, 3> > counts_;
+    std::vector<unsigned> saturation_;
+    std::set<Key, HigherPriority> choices_;
+    std::vector<Vertex> trail_;
+};
+
+std::vector<int> colorGraph(const Graph& graph, Deadline& budget) {
+    const Vertex n = graph.size();
+    const Vertex unseen = n;
+    std::vector<int> colors(n, -1);
+    std::vector<std::size_t> degree(n, 0);
+    std::vector<unsigned char> active(n, 0);
+    std::vector<Vertex> coreIndex(n, unseen);
+
+    for (Vertex start = 0; start < n; ++start) {
+        budget.poll();
+        if (colors[start] != -1) continue;
+        std::vector<Vertex> component(1, start);
+        colors[start] = 0;
+        bool bipartite = true;
+        for (std::size_t i = 0; i < component.size(); ++i) {
+            budget.poll();
+            const Vertex v = component[i];
+            for (Vertex w : graph[v]) {
+                budget.poll();
+                if (colors[w] == -1) {
+                    colors[w] = 1 - colors[v];
+                    component.push_back(w);
+                } else if (colors[w] == colors[v]) {
+                    bipartite = false;
+                }
+            }
+        }
+        if (bipartite) continue;
+
+        std::vector<Vertex> peeled;
+        for (Vertex v : component) {
+            budget.poll();
+            colors[v] = -1;
+            active[v] = 1;
+            degree[v] = graph[v].size();
+            if (degree[v] <= 2) peeled.push_back(v);
+        }
+        for (std::size_t i = 0; i < peeled.size(); ++i) {
+            budget.poll();
+            const Vertex v = peeled[i];
+            active[v] = 0;
+            for (Vertex w : graph[v]) {
+                budget.poll();
+                if (active[w] && --degree[w] == 2) peeled.push_back(w);
+            }
+        }
+
+        for (Vertex root : component) {
+            budget.poll();
+            if (!active[root] || coreIndex[root] != unseen) continue;
+            std::vector<Vertex> core(1, root);
+            coreIndex[root] = 0;
+            for (std::size_t i = 0; i < core.size(); ++i) {
+                budget.poll();
+                for (Vertex w : graph[core[i]]) {
+                    budget.poll();
+                    if (active[w] && coreIndex[w] == unseen) {
+                        coreIndex[w] = core.size();
+                        core.push_back(w);
+                    }
+                }
+            }
+            Graph local(core.size());
+            for (Vertex i = 0; i < core.size(); ++i) {
+                budget.poll();
+                local[i].reserve(degree[core[i]]);
+                for (Vertex w : graph[core[i]]) {
+                    budget.poll();
+                    if (active[w]) local[i].push_back(coreIndex[w]);
+                }
+            }
+            const std::vector<int> result = CoreSearch(local, core, budget).run();
+            for (Vertex i = 0; i < core.size(); ++i) {
+                budget.poll();
+                colors[core[i]] = result[i];
+            }
+        }
+        for (std::size_t i = peeled.size(); i > 0; --i) {
+            budget.poll();
+            const Vertex v = peeled[i - 1];
+            unsigned mask = 7;
+            for (Vertex w : graph[v]) {
+                budget.poll();
+                if (colors[w] >= 0) mask &= ~(1u << colors[w]);
+            }
+            if (mask == 0) throw std::logic_error("Invalid peeling reconstruction");
+            colors[v] = (mask & 1) ? 0 : ((mask & 2) ? 1 : 2);
+        }
+    }
+    budget.check();
+    return colors;
+}
+
+std::vector<int> findColors(const std::vector<Poly>& input, Deadline& budget) {
+    const Graph graph = buildGraph(input, budget);
+    std::vector<int> colors = colorGraph(graph, budget);
+    for (Vertex v = 0; v < graph.size(); ++v) {
+        budget.poll();
+        if (colors[v] < 0 || colors[v] > 2) throw std::logic_error("Uncolored rectangle");
+        for (Vertex w : graph[v]) {
+            budget.poll();
+            if (colors[v] == colors[w]) throw std::logic_error("Invalid graph coloring");
+        }
+    }
+    return colors;
+}
+
+void solveWithDeadline(const std::vector<Poly>& input,
+                       std::vector<Poly>& layer1,
+                       std::vector<Poly>& layer2,
+                       std::vector<Poly>& layer3,
+                       Clock::time_point end) {
+    Deadline budget(end);
+    budget.check();
+    const std::vector<int> colors = findColors(input, budget);
+    std::array<std::size_t, 3> counts = {{0, 0, 0}};
+    for (int color : colors) {
+        budget.poll();
+        ++counts[color];
+    }
+    std::array<std::vector<Poly>, 3> layers;
+    for (unsigned c = 0; c < 3; ++c) {
+        budget.check();
+        layers[c].reserve(counts[c]);
+    }
+    for (Vertex i = 0; i < input.size(); ++i) {
+        budget.poll();
+        layers[colors[i]].push_back(input[i]);
+    }
+    budget.check();
+    layer1.swap(layers[0]);
+    layer2.swap(layers[1]);
+    layer3.swap(layers[2]);
+}
+
 }
